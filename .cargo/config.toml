@@ -1,0 +1,3 @@
+# Fallback if feature unification is not enough (see README).
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"
