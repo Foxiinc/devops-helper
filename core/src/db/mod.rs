@@ -95,6 +95,10 @@ pub struct SyncPairRecord {
     pub local_path: String,
     pub remote_path: String,
     pub direction: String,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub use_gitignore: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -117,19 +121,40 @@ pub struct TrustedBinary {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialCheck {
+    pub ok: bool,
+    pub kind: String,
+    pub message: Option<String>,
+}
+
 pub struct Database {
     conn: Connection,
     master_key: [u8; 32],
+    credentials_reset_required: bool,
 }
 
 impl Database {
     pub fn open(path: impl AsRef<std::path::Path>) -> CoreResult<Self> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        let master_key = CryptoVault::ensure_master_key()?;
-        let db = Self { conn, master_key };
+        let (master_key, credentials_reset_required) = CryptoVault::ensure_master_key(path)?;
+        let db = Self {
+            conn,
+            master_key,
+            credentials_reset_required,
+        };
         db.migrate()?;
         db.seed_presets()?;
         Ok(db)
+    }
+
+    pub fn credentials_reset_required(&self) -> bool {
+        self.credentials_reset_required
+    }
+
+    pub fn dismiss_credentials_reset_notice(&mut self) {
+        self.credentials_reset_required = false;
     }
 
     fn migrate(&self) -> CoreResult<()> {
@@ -210,6 +235,8 @@ impl Database {
             ",
         )?;
         self.ensure_column("servers", "folder_id", "TEXT")?;
+        self.ensure_column("sync_pairs", "ignore_patterns", "TEXT NOT NULL DEFAULT '[]'")?;
+        self.ensure_column("sync_pairs", "use_gitignore", "INTEGER NOT NULL DEFAULT 0")?;
         self.repair_schema()?;
         Ok(())
     }
@@ -455,14 +482,15 @@ impl Database {
             (AuthType::Password, Some(password)) if !password.is_empty() => {
                 Some(CryptoVault::encrypt(password.as_bytes(), &self.master_key)?)
             }
-            (AuthType::Password, None) => self
+            (AuthType::Password, _) => self
                 .conn
                 .query_row(
                     "SELECT encrypted_password FROM servers WHERE id = ?1",
                     params![id],
                     |row| row.get(0),
                 )
-                .ok(),
+                .ok()
+                .flatten(),
             _ => None,
         };
 
@@ -490,6 +518,50 @@ impl Database {
         self.conn
             .execute("DELETE FROM servers WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    pub fn check_server_credentials(&self, id: &str) -> CoreResult<CredentialCheck> {
+        let server = self.get_server(id)?;
+        match server.auth_type {
+            AuthType::Password => match self.get_server_password(id) {
+                Ok(Some(_)) => Ok(CredentialCheck {
+                    ok: true,
+                    kind: "password".into(),
+                    message: None,
+                }),
+                Ok(None) => Ok(CredentialCheck {
+                    ok: false,
+                    kind: "password".into(),
+                    message: Some("no password stored — enter one and save".into()),
+                }),
+                Err(err) => Ok(CredentialCheck {
+                    ok: false,
+                    kind: "password".into(),
+                    message: Some(err.to_string()),
+                }),
+            },
+            AuthType::Key => {
+                let Some(key_id) = server.key_id else {
+                    return Ok(CredentialCheck {
+                        ok: false,
+                        kind: "key".into(),
+                        message: Some("no SSH key selected".into()),
+                    });
+                };
+                match self.get_key_private_pem(&key_id) {
+                    Ok(_) => Ok(CredentialCheck {
+                        ok: true,
+                        kind: "key".into(),
+                        message: None,
+                    }),
+                    Err(err) => Ok(CredentialCheck {
+                        ok: false,
+                        kind: "key".into(),
+                        message: Some(err.to_string()),
+                    }),
+                }
+            }
+        }
     }
 
     pub fn get_known_host(&self, host: &str, port: u16) -> CoreResult<Option<KnownHost>> {
@@ -643,13 +715,27 @@ impl Database {
         local_path: &str,
         remote_path: &str,
         direction: &str,
+        ignore_patterns: &[String],
+        use_gitignore: bool,
     ) -> CoreResult<SyncPairRecord> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
+        let ignore_json = serde_json::to_string(ignore_patterns)
+            .map_err(|e| CoreError::Other(format!("ignore patterns json: {e}")))?;
         self.conn.execute(
-            "INSERT INTO sync_pairs (id, name, server_id, local_path, remote_path, direction, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, name, server_id, local_path, remote_path, direction, now.to_rfc3339()],
+            "INSERT INTO sync_pairs (id, name, server_id, local_path, remote_path, direction, ignore_patterns, use_gitignore, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                name,
+                server_id,
+                local_path,
+                remote_path,
+                direction,
+                ignore_json,
+                use_gitignore as i32,
+                now.to_rfc3339()
+            ],
         )?;
 
         Ok(SyncPairRecord {
@@ -659,44 +745,44 @@ impl Database {
             local_path: local_path.to_string(),
             remote_path: remote_path.to_string(),
             direction: direction.to_string(),
+            ignore_patterns: ignore_patterns.to_vec(),
+            use_gitignore,
             created_at: now,
+        })
+    }
+
+    fn parse_ignore_patterns(raw: &str) -> Vec<String> {
+        serde_json::from_str(raw).unwrap_or_default()
+    }
+
+    fn row_to_sync_pair(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncPairRecord> {
+        Ok(SyncPairRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            server_id: row.get(2)?,
+            local_path: row.get(3)?,
+            remote_path: row.get(4)?,
+            direction: row.get(5)?,
+            ignore_patterns: Self::parse_ignore_patterns(&row.get::<_, String>(6)?),
+            use_gitignore: row.get::<_, i32>(7)? != 0,
+            created_at: parse_dt(row.get(8)?),
         })
     }
 
     pub fn list_sync_pairs(&self) -> CoreResult<Vec<SyncPairRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, server_id, local_path, remote_path, direction, created_at FROM sync_pairs ORDER BY name",
+            "SELECT id, name, server_id, local_path, remote_path, direction, ignore_patterns, use_gitignore, created_at FROM sync_pairs ORDER BY name",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SyncPairRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                server_id: row.get(2)?,
-                local_path: row.get(3)?,
-                remote_path: row.get(4)?,
-                direction: row.get(5)?,
-                created_at: parse_dt(row.get(6)?),
-            })
-        })?;
+        let rows = stmt.query_map([], Self::row_to_sync_pair)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
     pub fn get_sync_pair(&self, id: &str) -> CoreResult<SyncPairRecord> {
         self.conn
             .query_row(
-                "SELECT id, name, server_id, local_path, remote_path, direction, created_at FROM sync_pairs WHERE id = ?1",
+                "SELECT id, name, server_id, local_path, remote_path, direction, ignore_patterns, use_gitignore, created_at FROM sync_pairs WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(SyncPairRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        server_id: row.get(2)?,
-                        local_path: row.get(3)?,
-                        remote_path: row.get(4)?,
-                        direction: row.get(5)?,
-                        created_at: parse_dt(row.get(6)?),
-                    })
-                },
+                Self::row_to_sync_pair,
             )
             .map_err(|_| CoreError::SyncPairNotFound(id.to_string()))
     }

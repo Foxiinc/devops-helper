@@ -4,6 +4,7 @@ import { THEME_PRESETS } from "../theme/presets";
 import type { CustomThemeOverrides } from "../theme/types";
 import { NAV_ITEMS, type NavPreferences } from "../config/nav";
 import { KeysPanel } from "./KeysPanel";
+import { ActivityLogSection } from "./ActivityLogSection";
 import type { Server } from "../types";
 
 interface SettingsPanelProps {
@@ -243,6 +244,8 @@ export function SettingsPanel({
                 })}
               </div>
             </section>
+
+            <ActivityLogSection />
           </div>
         )}
 

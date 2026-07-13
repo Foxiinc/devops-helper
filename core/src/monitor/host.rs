@@ -4,11 +4,19 @@ use crate::db::{Database, Server};
 use crate::error::{CoreError, CoreResult};
 use crate::session::SessionManager;
 
-const LIST_PROCESSES_CMD: &str = r#"ps -eo pid=,user=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null | head -300 | while read -r pid user cpu mem comm; do
-  [ -z "$pid" ] && continue
-  cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 512)
-  printf '%s|%s|%s|%s|%s|%s\n' "$pid" "$user" "$cpu" "$mem" "$comm" "$cmd"
-done"#;
+/// Single remote command — awk only, no shell loops/printf (avoids quoting/% issues over SSH exec).
+const LIST_PROCESSES_CMD: &str = r#"ps -eo pid=,user=,pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null | head -300 | awk '
+$1 ~ /^[0-9]+$/ {
+  pid=$1; user=$2; cpu=$3; mem=$4; comm=$5;
+  cmd=comm;
+  path="/proc/" pid "/cmdline";
+  if ((getline raw < path) > 0) {
+    gsub(/\000/, " ", raw);
+    if (length(raw) > 0) cmd=raw;
+  }
+  close(path);
+  print pid "|" user "|" cpu "|" mem "|" comm "|" cmd;
+}'"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInfo {
@@ -50,7 +58,7 @@ impl HostMonitor {
             )));
         }
 
-        parse_process_output(&output)
+        Ok(parse_process_output(&output))
     }
 
     pub async fn list_processes_for_server(
@@ -59,7 +67,7 @@ impl HostMonitor {
         server: &Server,
     ) -> CoreResult<Vec<ProcessInfo>> {
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(db, server)?;
+            SessionManager::prepare_exec_credentials(db, server, None)?;
         Self::list_processes(
             sessions,
             server,
@@ -71,7 +79,7 @@ impl HostMonitor {
     }
 }
 
-pub fn parse_process_output(output: &str) -> CoreResult<Vec<ProcessInfo>> {
+pub fn parse_process_output(output: &str) -> Vec<ProcessInfo> {
     let mut processes = Vec::new();
 
     for line in output.lines() {
@@ -85,10 +93,9 @@ pub fn parse_process_output(output: &str) -> CoreResult<Vec<ProcessInfo>> {
             continue;
         }
 
-        let pid: u32 = parts[0]
-            .trim()
-            .parse()
-            .map_err(|_| CoreError::Other(format!("invalid pid: {}", parts[0])))?;
+        let Ok(pid) = parts[0].trim().parse::<u32>() else {
+            continue;
+        };
         let cpu: f64 = parts[2].trim().parse().unwrap_or(0.0);
         let mem: f64 = parts[3].trim().parse().unwrap_or(0.0);
         let cmdline = parts.get(5).unwrap_or(&"").trim().to_string();
@@ -105,7 +112,7 @@ pub fn parse_process_output(output: &str) -> CoreResult<Vec<ProcessInfo>> {
         });
     }
 
-    Ok(processes)
+    processes
 }
 
 #[cfg(test)]
@@ -115,10 +122,18 @@ mod tests {
     #[test]
     fn parses_pipe_delimited_ps_output() {
         let output = "1234|root|12.5|3.2|nginx|nginx: master process\n5678|www-data|1.0|0.5|nginx|nginx: worker process\n";
-        let list = parse_process_output(output).unwrap();
+        let list = parse_process_output(output);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].pid, 1234);
         assert_eq!(list[0].comm, "nginx");
         assert!(list[0].cmdline.contains("master"));
+    }
+
+    #[test]
+    fn skips_garbage_lines() {
+        let output = "printf '%s|broken|line\n1234|root|1|2|bash|bash\n";
+        let list = parse_process_output(output);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pid, 1234);
     }
 }

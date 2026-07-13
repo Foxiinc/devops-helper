@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod crypto;
 pub mod db;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod sftp;
 pub mod sync;
 pub mod updates;
 
+pub use audit::{AuditEntry, AuditLog};
 pub use db::Database;
 pub use error::{CoreError, CoreResult};
 pub use keys::KeyVault;

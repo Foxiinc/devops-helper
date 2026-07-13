@@ -20,6 +20,51 @@ fn db_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+fn audit(
+    state: &Arc<AppState>,
+    action: &str,
+    detail: impl AsRef<str>,
+    server_id: Option<&str>,
+) {
+    state.audit.record(action, detail, server_id);
+}
+
+#[tauri::command]
+pub fn log_action(
+    state: SharedState<'_>,
+    action: String,
+    detail: Option<String>,
+    server_id: Option<String>,
+) -> Result<(), String> {
+    audit(
+        state.inner(),
+        &action,
+        detail.unwrap_or_default(),
+        server_id.as_deref(),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_activity_log_path(state: SharedState<'_>) -> Result<String, String> {
+    Ok(state
+        .audit
+        .path()
+        .to_string_lossy()
+        .into_owned())
+}
+
+#[tauri::command]
+pub fn read_activity_log(
+    state: SharedState<'_>,
+    limit: Option<usize>,
+) -> Result<Vec<brisk_bastion_core::audit::AuditEntry>, String> {
+    state
+        .audit
+        .read_recent(limit.unwrap_or(200))
+        .map_err(db_err)
+}
+
 #[tauri::command]
 pub async fn list_servers(state: SharedState<'_>) -> Result<Vec<Server>, String> {
     state
@@ -37,6 +82,38 @@ pub async fn get_server(state: SharedState<'_>, id: String) -> Result<Server, St
         .lock()
         .map_err(db_err)?
         .get_server(&id)
+        .map_err(db_err)
+}
+
+#[tauri::command]
+pub fn get_vault_status(state: SharedState<'_>) -> Result<bool, String> {
+    Ok(state
+        .db
+        .lock()
+        .map_err(db_err)?
+        .credentials_reset_required())
+}
+
+#[tauri::command]
+pub fn dismiss_vault_notice(state: SharedState<'_>) -> Result<(), String> {
+    state
+        .db
+        .lock()
+        .map_err(db_err)?
+        .dismiss_credentials_reset_notice();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn check_server_credentials(
+    state: SharedState<'_>,
+    server_id: String,
+) -> Result<brisk_bastion_core::db::CredentialCheck, String> {
+    state
+        .db
+        .lock()
+        .map_err(db_err)?
+        .check_server_credentials(&server_id)
         .map_err(db_err)
 }
 
@@ -181,11 +258,19 @@ pub async fn connect_session(
     server_id: String,
     cols: u32,
     rows: u32,
+    password: Option<String>,
 ) -> Result<SessionSummary, String> {
     let (config, sid, known_fingerprint) = {
         let db = state.db.lock().map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
-        SessionManager::prepare_server_connection(&db, &server, cols, rows).map_err(db_err)?
+        SessionManager::prepare_server_connection(
+            &db,
+            &server,
+            cols,
+            rows,
+            password.as_deref(),
+        )
+        .map_err(db_err)?
     };
 
     state
@@ -302,7 +387,7 @@ pub async fn copy_id_to_server(
             .find(|k| k.id == key_id)
             .ok_or_else(|| format!("key not found: {key_id}"))?;
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(&db, &server).map_err(db_err)?;
+            SessionManager::prepare_exec_credentials(&db, &server, None).map_err(db_err)?;
         (server, key.public_key.trim().to_string(), password, private_key_pem, known_fingerprint)
     };
 
@@ -330,12 +415,13 @@ pub async fn list_remote_dir(
     state: SharedState<'_>,
     server_id: String,
     path: String,
+    password: Option<String>,
 ) -> Result<Vec<RemoteEntry>, String> {
     let (server, password, private_key_pem) = {
         let db = state.db.lock().map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
         let (password, private_key_pem) =
-            SftpBrowser::prepare_connection(&db, &server).map_err(db_err)?;
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
         (server, password, private_key_pem)
     };
 
@@ -354,12 +440,13 @@ pub async fn upload_file(
     server_id: String,
     local_path: String,
     remote_path: String,
+    password: Option<String>,
 ) -> Result<(), String> {
     let (server, password, private_key_pem) = {
         let db = state.db.lock().map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
         let (password, private_key_pem) =
-            SftpBrowser::prepare_connection(&db, &server).map_err(db_err)?;
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
         (server, password, private_key_pem)
     };
 
@@ -381,12 +468,13 @@ pub async fn download_file(
     server_id: String,
     remote_path: String,
     local_path: String,
+    password: Option<String>,
 ) -> Result<(), String> {
     let (server, password, private_key_pem) = {
         let db = state.db.lock().map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
         let (password, private_key_pem) =
-            SftpBrowser::prepare_connection(&db, &server).map_err(db_err)?;
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
         (server, password, private_key_pem)
     };
 
@@ -398,6 +486,62 @@ pub async fn download_file(
 
     browser
         .download_file(&remote_path, std::path::Path::new(&local_path))
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+pub async fn download_dir(
+    state: SharedState<'_>,
+    server_id: String,
+    remote_path: String,
+    local_path: String,
+    password: Option<String>,
+) -> Result<brisk_bastion_core::sftp::TransferResult, String> {
+    let (server, password, private_key_pem) = {
+        let db = state.db.lock().map_err(db_err)?;
+        let server = db.get_server(&server_id).map_err(db_err)?;
+        let (password, private_key_pem) =
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
+        (server, password, private_key_pem)
+    };
+
+    let browser = state
+        .sftp_pool
+        .get_or_connect(&server_id, &server, password, private_key_pem)
+        .await
+        .map_err(db_err)?;
+
+    browser
+        .download_dir(&remote_path, std::path::Path::new(&local_path))
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+pub async fn upload_dir(
+    state: SharedState<'_>,
+    server_id: String,
+    local_path: String,
+    remote_path: String,
+    password: Option<String>,
+) -> Result<brisk_bastion_core::sftp::TransferResult, String> {
+    let (server, password, private_key_pem) = {
+        let db = state.db.lock().map_err(db_err)?;
+        let server = db.get_server(&server_id).map_err(db_err)?;
+        let (password, private_key_pem) =
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
+        (server, password, private_key_pem)
+    };
+
+    let browser = state
+        .sftp_pool
+        .get_or_connect(&server_id, &server, password, private_key_pem)
+        .await
+        .map_err(db_err)?;
+
+    browser
+        .upload_dir(std::path::Path::new(&local_path), &remote_path)
         .await
         .map_err(db_err)
 }
@@ -419,6 +563,22 @@ pub struct CreateSyncPairInput {
     pub local_path: String,
     pub remote_path: String,
     pub direction: String,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub use_gitignore: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SyncDraftInput {
+    pub server_id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub direction: String,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub use_gitignore: bool,
 }
 
 #[tauri::command]
@@ -436,7 +596,43 @@ pub async fn create_sync_pair(
             &input.local_path,
             &input.remote_path,
             &input.direction,
+            &input.ignore_patterns,
+            input.use_gitignore,
         )
+        .map_err(db_err)
+}
+
+#[tauri::command]
+pub async fn preview_sync_draft(
+    state: SharedState<'_>,
+    input: SyncDraftInput,
+    password: Option<String>,
+) -> Result<brisk_bastion_core::sync::SyncPreview, String> {
+    use brisk_bastion_core::sync::{SyncDirection, SyncEngine, SyncOptions, SyncPair};
+
+    let (server, password, private_key_pem) = {
+        let db = state.db.lock().map_err(db_err)?;
+        let server = db.get_server(&input.server_id).map_err(db_err)?;
+        let (password, private_key_pem) =
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
+        (server, password, private_key_pem)
+    };
+
+    let pair = SyncPair {
+        id: String::new(),
+        name: String::new(),
+        server_id: input.server_id,
+        local_path: input.local_path,
+        remote_path: input.remote_path,
+        direction: SyncDirection::from_str(&input.direction),
+        options: SyncOptions {
+            ignore_patterns: input.ignore_patterns,
+            use_gitignore: input.use_gitignore,
+        },
+    };
+
+    SyncEngine::preview(&state.sftp_pool, &pair, &server, password, private_key_pem)
+        .await
         .map_err(db_err)
 }
 
@@ -458,7 +654,7 @@ pub async fn preview_sync(state: SharedState<'_>, pair_id: String) -> Result<Syn
         let pair = SyncEngine::from_record(&record);
         let server = db.get_server(&pair.server_id).map_err(db_err)?;
         let (password, private_key_pem) =
-            SftpBrowser::prepare_connection(&db, &server).map_err(db_err)?;
+            SftpBrowser::prepare_connection(&db, &server, None).map_err(db_err)?;
         (pair, server, password, private_key_pem)
     };
 
@@ -473,6 +669,7 @@ pub async fn run_sync(
     state: SharedState<'_>,
     pair_id: String,
     dry_run: bool,
+    password: Option<String>,
 ) -> Result<SyncPreview, String> {
     let (pair, server, password, private_key_pem) = {
         let db = state.db.lock().map_err(db_err)?;
@@ -480,7 +677,7 @@ pub async fn run_sync(
         let pair = SyncEngine::from_record(&record);
         let server = db.get_server(&pair.server_id).map_err(db_err)?;
         let (password, private_key_pem) =
-            SftpBrowser::prepare_connection(&db, &server).map_err(db_err)?;
+            SftpBrowser::prepare_connection(&db, &server, password.as_deref()).map_err(db_err)?;
         (pair, server, password, private_key_pem)
     };
 
@@ -562,7 +759,7 @@ pub async fn run_scenario(
         let scenario = ScenarioRunner::load_from_db(&db, &scenario_id).map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(&db, &server).map_err(db_err)?;
+            SessionManager::prepare_exec_credentials(&db, &server, None).map_err(db_err)?;
         (scenario, server, password, private_key_pem, known_fingerprint)
     };
 
@@ -612,12 +809,13 @@ pub fn save_ui_state(app: AppHandle, state: String) -> Result<(), String> {
 // --- Monitor ---
 
 macro_rules! with_server_creds {
-    ($state:expr, $server_id:expr, |$server:ident, $password:ident, $pem:ident, $fp:ident| $body:expr) => {{
-        let ($server, $password, $pem, $fp) = {
+    ($state:expr, $server_id:expr, $password:expr, |$server:ident, $pass:ident, $pem:ident, $fp:ident| $body:expr) => {{
+        let ($server, $pass, $pem, $fp) = {
             let db = $state.db.lock().map_err(db_err)?;
             let server = db.get_server(&$server_id).map_err(db_err)?;
             let (password, private_key_pem, known_fingerprint) =
-                SessionManager::prepare_exec_credentials(&db, &server).map_err(db_err)?;
+                SessionManager::prepare_exec_credentials(&db, &server, $password.as_deref())
+                    .map_err(db_err)?;
             (server, password, private_key_pem, known_fingerprint)
         };
         $body
@@ -628,8 +826,9 @@ macro_rules! with_server_creds {
 pub async fn list_processes(
     state: SharedState<'_>,
     server_id: String,
+    password: Option<String>,
 ) -> Result<Vec<brisk_bastion_core::monitor::ProcessInfo>, String> {
-    with_server_creds!(state, server_id, |server, password, pem, fp| {
+    with_server_creds!(state, server_id, password, |server, password, pem, fp| {
         brisk_bastion_core::monitor::HostMonitor::list_processes(
             &state.sessions,
             &server,
@@ -646,8 +845,9 @@ pub async fn list_processes(
 pub async fn refresh_processes(
     state: SharedState<'_>,
     server_id: String,
+    password: Option<String>,
 ) -> Result<Vec<brisk_bastion_core::monitor::ProcessInfo>, String> {
-    list_processes(state, server_id).await
+    list_processes(state, server_id, password).await
 }
 
 #[tauri::command]
@@ -655,8 +855,9 @@ pub async fn verify_process_trust(
     state: SharedState<'_>,
     server_id: String,
     pid: u32,
+    password: Option<String>,
 ) -> Result<brisk_bastion_core::monitor::ProcessTrustInfo, String> {
-    let sha256 = with_server_creds!(state, server_id, |server, password, pem, fp| {
+    let sha256 = with_server_creds!(state, server_id, password, |server, password, pem, fp| {
         brisk_bastion_core::monitor::TrustService::binary_sha256(
             &state.sessions,
             &server,
@@ -689,8 +890,9 @@ pub async fn verify_process_trust(
 pub async fn list_docker_containers(
     state: SharedState<'_>,
     server_id: String,
+    password: Option<String>,
 ) -> Result<Vec<brisk_bastion_core::monitor::DockerContainer>, String> {
-    with_server_creds!(state, server_id, |server, password, pem, fp| {
+    with_server_creds!(state, server_id, password, |server, password, pem, fp| {
         brisk_bastion_core::monitor::DockerMonitor::list_containers(
             &state.sessions,
             &server,
@@ -708,8 +910,9 @@ pub async fn list_docker_container_processes(
     state: SharedState<'_>,
     server_id: String,
     container: String,
+    password: Option<String>,
 ) -> Result<Vec<brisk_bastion_core::monitor::ContainerProcess>, String> {
-    with_server_creds!(state, server_id, |server, password, pem, fp| {
+    with_server_creds!(state, server_id, password, |server, password, pem, fp| {
         brisk_bastion_core::monitor::DockerMonitor::list_container_processes(
             &state.sessions,
             &server,
@@ -782,12 +985,14 @@ pub async fn check_updates(
     state: SharedState<'_>,
     server_id: String,
     include_cve: Option<bool>,
+    password: Option<String>,
 ) -> Result<brisk_bastion_core::updates::UpdatesReport, String> {
     let (server, password, pem, fp) = {
         let db = state.db.lock().map_err(db_err)?;
         let server = db.get_server(&server_id).map_err(db_err)?;
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(&db, &server).map_err(db_err)?;
+            SessionManager::prepare_exec_credentials(&db, &server, password.as_deref())
+                .map_err(db_err)?;
         (server, password, private_key_pem, known_fingerprint)
     };
 
@@ -827,4 +1032,32 @@ pub async fn check_updates(
     }
 
     Ok(report)
+}
+
+#[tauri::command]
+pub async fn run_updates(
+    state: SharedState<'_>,
+    server_id: String,
+    packages: Option<Vec<String>>,
+    password: Option<String>,
+) -> Result<brisk_bastion_core::updates::UpgradeResult, String> {
+    let (server, password, pem, fp) = {
+        let db = state.db.lock().map_err(db_err)?;
+        let server = db.get_server(&server_id).map_err(db_err)?;
+        let (password, private_key_pem, known_fingerprint) =
+            SessionManager::prepare_exec_credentials(&db, &server, password.as_deref())
+                .map_err(db_err)?;
+        (server, password, private_key_pem, known_fingerprint)
+    };
+
+    brisk_bastion_core::updates::run_upgrade(
+        &state.sessions,
+        &server,
+        packages,
+        password,
+        pem,
+        fp,
+    )
+    .await
+    .map_err(db_err)
 }

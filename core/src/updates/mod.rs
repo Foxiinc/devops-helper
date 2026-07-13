@@ -3,10 +3,12 @@ pub mod distro;
 pub mod dnf;
 pub mod osv;
 pub mod types;
+pub mod upgrade;
 
 pub use distro::{OsInfo, PackageManager};
 pub use osv::OsvClient;
 pub use types::{CveInfo, PackageUpdate, UpdatesReport};
+pub use upgrade::{run_upgrade, UpgradeResult};
 
 use crate::db::{Database, Server};
 use crate::error::CoreResult;
@@ -39,7 +41,7 @@ impl UpdatesChecker {
         include_cve: bool,
     ) -> CoreResult<UpdatesReport> {
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(db, server)?;
+            SessionManager::prepare_exec_credentials(db, server, None)?;
         let mut report = Self::fetch_updates(
             sessions,
             server,
@@ -61,6 +63,25 @@ impl UpdatesChecker {
         }
 
         Ok(report)
+    }
+
+    pub async fn run_upgrade_for_server(
+        sessions: &SessionManager,
+        db: &Database,
+        server: &Server,
+        packages: Option<Vec<String>>,
+    ) -> CoreResult<UpgradeResult> {
+        let (password, private_key_pem, known_fingerprint) =
+            SessionManager::prepare_exec_credentials(db, server, None)?;
+        run_upgrade(
+            sessions,
+            server,
+            packages,
+            password,
+            private_key_pem,
+            known_fingerprint,
+        )
+        .await
     }
 }
 

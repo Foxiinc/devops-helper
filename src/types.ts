@@ -63,6 +63,18 @@ export interface RemoteEntry {
   modified?: number;
 }
 
+export interface TransferResult {
+  files_transferred: number;
+  dirs_created: number;
+}
+
+export interface AuditEntry {
+  ts: string;
+  action: string;
+  detail: string;
+  server_id?: string;
+}
+
 export interface SyncPairRecord {
   id: string;
   name: string;
@@ -70,6 +82,8 @@ export interface SyncPairRecord {
   local_path: string;
   remote_path: string;
   direction: string;
+  ignore_patterns?: string[];
+  use_gitignore?: boolean;
   created_at: string;
 }
 
@@ -77,11 +91,23 @@ export interface SyncPreviewItem {
   path: string;
   action: string;
   reason: string;
+  size_bytes?: number;
 }
 
 export interface SyncPreview {
   items: SyncPreviewItem[];
   total_files: number;
+  skipped_count?: number;
+  total_bytes?: number;
+}
+
+export interface SyncDraftInput {
+  server_id: string;
+  local_path: string;
+  remote_path: string;
+  direction: string;
+  ignore_patterns?: string[];
+  use_gitignore?: boolean;
 }
 
 export interface SyncProgress {
@@ -193,4 +219,11 @@ export interface UpdatesReport {
   os: OsInfo;
   packages: PackageUpdate[];
   checked_at: string;
+}
+
+export interface UpgradeResult {
+  success: boolean;
+  exit_code: number;
+  output: string;
+  package_manager: string;
 }

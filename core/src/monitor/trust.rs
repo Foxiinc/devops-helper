@@ -56,7 +56,7 @@ impl TrustService {
         pid: u32,
     ) -> CoreResult<ProcessTrustInfo> {
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(db, server)?;
+            SessionManager::prepare_exec_credentials(db, server, None)?;
         let sha256 = Self::binary_sha256(
             sessions,
             server,

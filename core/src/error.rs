@@ -37,6 +37,12 @@ pub enum CoreError {
     #[error("authentication failed")]
     AuthFailed,
 
+    #[error("password required")]
+    PasswordRequired,
+
+    #[error("private key required")]
+    PrivateKeyRequired,
+
     #[error("host key rejected")]
     HostKeyRejected,
 

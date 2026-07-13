@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { listen } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
-import { api } from "../api";
+import { api, logUiAction } from "../api";
 import { useTheme } from "../context/ThemeContext";
 
 interface TerminalViewProps {
@@ -72,6 +72,88 @@ export function TerminalView({
 
     const sid = sessionId;
 
+    const copySelection = () => {
+      const selection = term.getSelection();
+      if (!selection) return false;
+      void navigator.clipboard.writeText(selection).then(() => {
+        logUiAction("terminal.copy", `${selection.length} chars`, sid);
+      });
+      return true;
+    };
+
+    const PASTE_DEDUPE_MS = 300;
+    let lastPasteAt = 0;
+    let lastPasteText = "";
+
+    const pasteTextOnce = (text: string) => {
+      if (!text) return;
+      const now = Date.now();
+      if (text === lastPasteText && now - lastPasteAt < PASTE_DEDUPE_MS) return;
+      lastPasteAt = now;
+      lastPasteText = text;
+      void api.sendTerminalInput(
+        sid,
+        bytesToBase64(new TextEncoder().encode(text)),
+      );
+      logUiAction("terminal.paste", `${text.length} chars`, sid);
+    };
+
+    const blockNativePaste = (event: Event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+
+    const onPaste = (event: ClipboardEvent) => {
+      blockNativePaste(event);
+      pasteTextOnce(event.clipboardData?.getData("text/plain") ?? "");
+    };
+
+    const onBeforeInput = (event: Event) => {
+      const inputEvent = event as InputEvent;
+      if (inputEvent.inputType !== "insertFromPaste") return;
+      blockNativePaste(event);
+      pasteTextOnce(inputEvent.data ?? "");
+    };
+
+    const textarea = term.element?.querySelector("textarea");
+    textarea?.addEventListener("paste", onPaste, true);
+    textarea?.addEventListener("beforeinput", onBeforeInput, true);
+
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type !== "keydown") return true;
+
+      const key = event.key.toLowerCase();
+      const mod = event.ctrlKey || event.metaKey;
+      const isPasteKey =
+        (mod && event.shiftKey && key === "v") ||
+        (!mod && event.shiftKey && key === "insert");
+
+      if (isPasteKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        void navigator.clipboard.readText().then(pasteTextOnce);
+        return false;
+      }
+
+      if (mod && event.shiftKey) {
+        if (key === "c" && copySelection()) {
+          event.preventDefault();
+          return false;
+        }
+        if (key === "insert" && copySelection()) {
+          event.preventDefault();
+          return false;
+        }
+      }
+
+      if (mod && !event.shiftKey && key === "insert" && copySelection()) {
+        event.preventDefault();
+        return false;
+      }
+
+      return true;
+    });
+
     const resizeObserver = new ResizeObserver(() => {
       if (!termRef.current) return;
       fitAddon.fit();
@@ -106,6 +188,8 @@ export function TerminalView({
     );
 
     return () => {
+      textarea?.removeEventListener("paste", onPaste, true);
+      textarea?.removeEventListener("beforeinput", onBeforeInput, true);
       onData.dispose();
       resizeObserver.disconnect();
       void unlistenOutput.then((fn) => fn());

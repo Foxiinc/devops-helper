@@ -1,11 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { RemoteEntry, Server } from "../types";
 import { api } from "../api";
 import { useUi } from "../context/UiContext";
+import { formatBackendError, needsPasswordPrompt } from "../utils/backendError";
+import { withServerPassword } from "../utils/serverAccess";
 import { loadUiState, patchSftpState } from "../state/persist";
 
 interface SftpPanelProps {
   servers: Server[];
+  onOpenSyncSetup?: (draft: {
+    serverId: string;
+    localPath: string;
+    remotePath: string;
+    direction?: "push" | "pull";
+  }) => void;
 }
 
 function formatSize(bytes: number): string {
@@ -30,8 +38,13 @@ function parentRemotePath(path: string): string | null {
   return idx <= 0 ? "/" : normalized.slice(0, idx);
 }
 
-export function SftpPanel({ servers }: SftpPanelProps) {
-  const { toast } = useUi();
+function joinRemote(base: string, name: string): string {
+  if (base.endsWith("/")) return `${base}${name}`;
+  return `${base}/${name}`;
+}
+
+export function SftpPanel({ servers, onOpenSyncSetup }: SftpPanelProps) {
+  const { toast, prompt, confirm } = useUi();
   const saved = loadUiState().sftp;
 
   const [serverId, setServerId] = useState(saved.serverId);
@@ -42,6 +55,13 @@ export function SftpPanel({ servers }: SftpPanelProps) {
   const [selectedLocal, setSelectedLocal] = useState<RemoteEntry | null>(null);
   const [selectedRemote, setSelectedRemote] = useState<RemoteEntry | null>(null);
   const [loading, setLoading] = useState(false);
+  const [transferring, setTransferring] = useState(false);
+  const [authBlocked, setAuthBlocked] = useState(false);
+
+  const server = useMemo(
+    () => servers.find((s) => s.id === serverId),
+    [servers, serverId],
+  );
 
   const loadLocal = async (path: string) => {
     try {
@@ -49,19 +69,36 @@ export function SftpPanel({ servers }: SftpPanelProps) {
       setLocalPath(path);
       setSelectedLocal(null);
     } catch (err) {
-      toast.error(String(err));
+      toast.error(formatBackendError(err));
     }
   };
 
-  const loadRemote = async (path: string) => {
-    if (!serverId) return;
+  const loadRemote = async (path: string, password?: string) => {
+    if (!serverId || !server) return;
     try {
-      setRemoteEntries(await api.listRemoteDir(serverId, path));
+      setRemoteEntries(await api.listRemoteDir(serverId, path, password));
       setRemotePath(path);
       setSelectedRemote(null);
+      setAuthBlocked(false);
     } catch (err) {
-      toast.error(String(err));
+      if (needsPasswordPrompt(err, server.auth_type)) {
+        setAuthBlocked(true);
+        return;
+      }
+      toast.error(formatBackendError(err));
     }
+  };
+
+  const unlockRemote = async (path: string) => {
+    if (!server) return;
+    await withServerPassword(server, { toast, prompt, confirm }, (password) =>
+      api.listRemoteDir(serverId, path, password).then((entries) => {
+        setRemoteEntries(entries);
+        setRemotePath(path);
+        setSelectedRemote(null);
+        setAuthBlocked(false);
+      }),
+    );
   };
 
   useEffect(() => {
@@ -76,6 +113,10 @@ export function SftpPanel({ servers }: SftpPanelProps) {
     if (serverId) void loadRemote(remotePath);
   }, [serverId]);
 
+  useEffect(() => {
+    setAuthBlocked(false);
+  }, [serverId]);
+
   const refresh = async () => {
     setLoading(true);
     await Promise.all([
@@ -86,30 +127,87 @@ export function SftpPanel({ servers }: SftpPanelProps) {
   };
 
   const upload = async () => {
-    if (!selectedLocal || !serverId || selectedLocal.is_dir) return;
-    const remoteFile = remotePath.endsWith("/")
-      ? `${remotePath}${selectedLocal.name}`
-      : `${remotePath}/${selectedLocal.name}`;
-    toast.info(`Uploading ${selectedLocal.name}...`);
+    if (!selectedLocal || !serverId || !server) return;
+    const remoteTarget = joinRemote(remotePath, selectedLocal.name);
+
+    setTransferring(true);
+    const label = selectedLocal.is_dir ? selectedLocal.name : selectedLocal.name;
+    toast.info(
+      selectedLocal.is_dir
+        ? `Uploading folder ${label}…`
+        : `Uploading ${label}…`,
+    );
+
+    const doUpload = async (password?: string) => {
+      if (selectedLocal.is_dir) {
+        const result = await api.uploadDir(
+          serverId,
+          selectedLocal.path,
+          remoteTarget,
+          password,
+        );
+        toast.success(
+          `Uploaded folder ${label} (${result.files_transferred} files, ${result.dirs_created} dirs)`,
+        );
+      } else {
+        await api.uploadFile(serverId, selectedLocal.path, remoteTarget, password);
+        toast.success(`Uploaded ${label}`);
+      }
+      await loadRemote(remotePath, password);
+    };
+
     try {
-      await api.uploadFile(serverId, selectedLocal.path, remoteFile);
-      toast.success(`Uploaded ${selectedLocal.name}`);
-      await loadRemote(remotePath);
+      await doUpload();
     } catch (err) {
-      toast.error(String(err));
+      if (needsPasswordPrompt(err, server.auth_type)) {
+        await withServerPassword(server, { toast, prompt, confirm }, doUpload);
+      } else {
+        toast.error(formatBackendError(err));
+      }
+    } finally {
+      setTransferring(false);
     }
   };
 
   const download = async () => {
-    if (!selectedRemote || !serverId || selectedRemote.is_dir) return;
-    const localFile = `${localPath}\\${selectedRemote.name}`;
-    toast.info(`Downloading ${selectedRemote.name}...`);
-    try {
-      await api.downloadFile(serverId, selectedRemote.path, localFile);
-      toast.success(`Downloaded to ${localFile}`);
+    if (!selectedRemote || !serverId || !server) return;
+    const localTarget = `${localPath}\\${selectedRemote.name}`;
+
+    setTransferring(true);
+    toast.info(
+      selectedRemote.is_dir
+        ? `Downloading folder ${selectedRemote.name}…`
+        : `Downloading ${selectedRemote.name}…`,
+    );
+
+    const doDownload = async (password?: string) => {
+      if (selectedRemote.is_dir) {
+        const result = await api.downloadDir(
+          serverId,
+          selectedRemote.path,
+          localTarget,
+          password,
+        );
+        toast.success(
+          `Downloaded folder ${selectedRemote.name} (${result.files_transferred} files, ${result.dirs_created} dirs)`,
+        );
+      } else {
+        await api.downloadFile(serverId, selectedRemote.path, localTarget, password);
+        toast.success(`Downloaded to ${localTarget}`);
+      }
       await loadLocal(localPath);
+    };
+
+    try {
+      await doDownload();
     } catch (err) {
-      toast.error(String(err));
+      if (needsPasswordPrompt(err, server.auth_type)) {
+        await withServerPassword(server, { toast, prompt, confirm }, doDownload);
+      } else {
+        toast.error(formatBackendError(err));
+      }
+    } finally {
+      setTransferring(false);
     }
   };
 
@@ -121,11 +219,11 @@ export function SftpPanel({ servers }: SftpPanelProps) {
     canGoUp: boolean,
     onGoUp: () => void,
   ) => (
-    <div className="flex-1 overflow-y-auto">
+    <>
       {canGoUp && (
         <button
           type="button"
-          className="bb-text bb-row-hover bb-border flex w-full items-center gap-2 border-b px-3 py-1.5 text-left text-sm"
+          className="bb-text bb-row-hover bb-border flex w-full shrink-0 items-center gap-2 border-b px-3 py-1.5 text-left text-sm"
           onClick={onGoUp}
           onDoubleClick={onGoUp}
         >
@@ -137,7 +235,7 @@ export function SftpPanel({ servers }: SftpPanelProps) {
         <button
           type="button"
           key={entry.path}
-          className={`bb-text bb-row-hover flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm ${
+          className={`bb-text bb-row-hover flex w-full shrink-0 items-center gap-2 px-3 py-1.5 text-left text-sm ${
             selected?.path === entry.path ? "bb-row-selected" : ""
           }`}
           onClick={() => onSelect(entry)}
@@ -150,7 +248,7 @@ export function SftpPanel({ servers }: SftpPanelProps) {
           )}
         </button>
       ))}
-    </div>
+    </>
   );
 
   const goLocalUp = () => {
@@ -163,9 +261,13 @@ export function SftpPanel({ servers }: SftpPanelProps) {
     if (parent) void loadRemote(parent);
   };
 
+  const busy = loading || transferring;
+  const uploadLabel = selectedLocal?.is_dir ? "Upload folder →" : "Upload →";
+  const downloadLabel = selectedRemote?.is_dir ? "← Download folder" : "← Download";
+
   return (
-    <div className="flex h-full flex-col p-4">
-      <div className="mb-4 flex flex-wrap items-center gap-3">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden p-4">
+      <div className="mb-4 flex shrink-0 flex-wrap items-center gap-3">
         <h2 className="bb-page-title">File Transfer</h2>
         <select
           className="input max-w-xs"
@@ -179,61 +281,102 @@ export function SftpPanel({ servers }: SftpPanelProps) {
             </option>
           ))}
         </select>
-        <button className="btn-secondary" onClick={refresh} disabled={loading}>
+        <button className="btn-secondary" onClick={() => void refresh()} disabled={busy}>
           Refresh
         </button>
-        <button className="btn-primary" onClick={upload} disabled={!selectedLocal || !serverId}>
-          Upload →
+        <button
+          className="btn-primary"
+          onClick={() => void upload()}
+          disabled={!selectedLocal || !serverId || busy}
+        >
+          {uploadLabel}
         </button>
-        <button className="btn-primary" onClick={download} disabled={!selectedRemote || !serverId}>
-          ← Download
+        <button
+          className="btn-primary"
+          onClick={() => void download()}
+          disabled={!selectedRemote || !serverId || busy}
+        >
+          {downloadLabel}
+        </button>
+        <button
+          type="button"
+          className="btn-secondary"
+          disabled={!serverId || busy}
+          onClick={() =>
+            onOpenSyncSetup?.({
+              serverId,
+              localPath,
+              remotePath,
+              direction: "push",
+            })
+          }
+          title="Create sync pair from current folder paths"
+        >
+          ⟳ Sync this folder
         </button>
       </div>
 
-      <div className="grid min-h-0 flex-1 grid-cols-2 gap-4">
-        <div className="bb-panel flex flex-col">
-          <div className="bb-border border-b p-2">
+      {authBlocked && (
+        <div className="mb-4 flex shrink-0 flex-wrap items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <span>Stored password cannot be decrypted — enter it again to browse remote files.</span>
+          <button
+            type="button"
+            className="btn-primary px-2 py-1 text-xs"
+            onClick={() => void unlockRemote(remotePath)}
+          >
+            Enter password
+          </button>
+        </div>
+      )}
+
+      <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 overflow-hidden">
+        <div className="bb-panel flex min-h-0 flex-col overflow-hidden">
+          <div className="bb-border shrink-0 border-b p-2">
             <p className="bb-muted text-xs">Local (Windows)</p>
             <input
               className="input mt-1 font-mono text-xs"
               value={localPath}
               onChange={(e) => setLocalPath(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && loadLocal(localPath)}
+              onKeyDown={(e) => e.key === "Enter" && void loadLocal(localPath)}
             />
           </div>
-          {renderEntries(
-            localEntries,
-            selectedLocal,
-            setSelectedLocal,
-            (e) => loadLocal(e.path),
-            parentLocalPath(localPath) !== null,
-            goLocalUp,
-          )}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {renderEntries(
+              localEntries,
+              selectedLocal,
+              setSelectedLocal,
+              (e) => void loadLocal(e.path),
+              parentLocalPath(localPath) !== null,
+              goLocalUp,
+            )}
+          </div>
         </div>
 
-        <div className="bb-panel flex flex-col">
-          <div className="bb-border border-b p-2">
+        <div className="bb-panel flex min-h-0 flex-col overflow-hidden">
+          <div className="bb-border shrink-0 border-b p-2">
             <p className="bb-muted text-xs">Remote (SFTP)</p>
             <input
               className="input mt-1 font-mono text-xs"
               value={remotePath}
               onChange={(e) => setRemotePath(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && loadRemote(remotePath)}
+              onKeyDown={(e) => e.key === "Enter" && void loadRemote(remotePath)}
               disabled={!serverId}
             />
           </div>
-          {serverId ? (
-            renderEntries(
-              remoteEntries,
-              selectedRemote,
-              setSelectedRemote,
-              (e) => loadRemote(e.path),
-              parentRemotePath(remotePath) !== null,
-              goRemoteUp,
-            )
-          ) : (
-            <p className="bb-muted p-4 text-sm">Select a server to browse remote files</p>
-          )}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {serverId ? (
+              renderEntries(
+                remoteEntries,
+                selectedRemote,
+                setSelectedRemote,
+                (e) => void loadRemote(e.path),
+                parentRemotePath(remotePath) !== null,
+                goRemoteUp,
+              )
+            ) : (
+              <p className="bb-muted p-4 text-sm">Select a server to browse remote files</p>
+            )}
+          </div>
         </div>
       </div>
     </div>

@@ -37,6 +37,8 @@ interface PromptOptions {
   placeholder?: string;
   confirmLabel?: string;
   cancelLabel?: string;
+  /** Mask input (SSH/server password) */
+  secret?: boolean;
 }
 
 type ModalState =
@@ -141,6 +143,7 @@ function UiModal({ modal, onClose }: { modal: ModalState; onClose: () => void })
           <input
             ref={inputRef}
             autoFocus
+            type={modal.secret ? "password" : "text"}
             className="input mt-4"
             value={value}
             placeholder={modal.placeholder}

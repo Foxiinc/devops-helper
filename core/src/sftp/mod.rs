@@ -5,6 +5,7 @@ use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::client;
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::db::{AuthType, Database, Server};
@@ -17,6 +18,12 @@ pub struct RemoteEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferResult {
+    pub files_transferred: usize,
+    pub dirs_created: usize,
 }
 
 pub struct SftpBrowser {
@@ -40,9 +47,14 @@ impl SftpBrowser {
     pub fn prepare_connection(
         db: &Database,
         server: &Server,
+        password_override: Option<&str>,
     ) -> CoreResult<(Option<String>, Option<Vec<u8>>)> {
         let password = if server.auth_type == AuthType::Password {
-            db.get_server_password(&server.id)?
+            if let Some(password) = password_override.filter(|p| !p.is_empty()) {
+                Some(password.to_string())
+            } else {
+                db.get_server_password(&server.id)?
+            }
         } else {
             None
         };
@@ -154,17 +166,127 @@ impl SftpBrowser {
     pub async fn upload_file(&self, local: &Path, remote: &str) -> CoreResult<()> {
         let data = tokio::fs::read(local).await?;
         let sftp = self.sftp.lock().await;
-        sftp.write(remote, &data)
+        ensure_remote_parents(&sftp, remote).await?;
+        let mut file = sftp
+            .create(remote)
+            .await
+            .map_err(|e| CoreError::Sftp(e.to_string()))?;
+        file.write_all(&data)
             .await
             .map_err(|e| CoreError::Sftp(e.to_string()))?;
         Ok(())
     }
 
-    pub async fn ensure_dir(&self, path: &str) -> CoreResult<()> {
-        let sftp = self.sftp.lock().await;
-        let _ = sftp.create_dir(path).await;
-        Ok(())
+    pub async fn download_dir(&self, remote: &str, local: &Path) -> CoreResult<TransferResult> {
+        let mut result = TransferResult {
+            files_transferred: 0,
+            dirs_created: 0,
+        };
+        std::fs::create_dir_all(local)?;
+        result.dirs_created += 1;
+
+        let mut stack = vec![(remote.to_string(), local.to_path_buf())];
+        while let Some((remote_dir, local_dir)) = stack.pop() {
+            for entry in self.list_dir(&remote_dir).await? {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let local_path = local_dir.join(&entry.name);
+                if entry.is_dir {
+                    std::fs::create_dir_all(&local_path)?;
+                    result.dirs_created += 1;
+                    stack.push((entry.path, local_path));
+                } else {
+                    self.download_file(&entry.path, &local_path).await?;
+                    result.files_transferred += 1;
+                }
+            }
+        }
+
+        Ok(result)
     }
+
+    pub async fn upload_dir(&self, local: &Path, remote: &str) -> CoreResult<TransferResult> {
+        let mut result = TransferResult {
+            files_transferred: 0,
+            dirs_created: 0,
+        };
+        self.ensure_dir_tree(remote).await?;
+        result.dirs_created += 1;
+
+        let mut stack = vec![(local.to_path_buf(), remote.to_string())];
+        while let Some((local_dir, remote_dir)) = stack.pop() {
+            for entry in std::fs::read_dir(&local_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let remote_path = join_remote(&remote_dir, &name);
+                let metadata = entry.metadata()?;
+                if metadata.is_dir() {
+                    self.ensure_dir_tree(&remote_path).await?;
+                    result.dirs_created += 1;
+                    stack.push((entry.path(), remote_path));
+                } else {
+                    self.upload_file(&entry.path(), &remote_path).await?;
+                    result.files_transferred += 1;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub async fn ensure_dir_tree(&self, path: &str) -> CoreResult<()> {
+        let sftp = self.sftp.lock().await;
+        ensure_remote_dir_chain(&sftp, path).await
+    }
+
+    pub async fn ensure_dir(&self, path: &str) -> CoreResult<()> {
+        self.ensure_dir_tree(path).await
+    }
+}
+
+async fn ensure_remote_parents(
+    sftp: &SftpSession,
+    remote_path: &str,
+) -> CoreResult<()> {
+    let normalized = remote_path.replace('\\', "/");
+    let Some(parent) = normalized.rsplit_once('/') else {
+        return Ok(());
+    };
+    let parent = parent.0;
+    if parent.is_empty() {
+        return Ok(());
+    }
+    ensure_remote_dir_chain(sftp, parent).await
+}
+
+async fn ensure_remote_dir_chain(
+    sftp: &SftpSession,
+    remote_path: &str,
+) -> CoreResult<()> {
+    let normalized = remote_path.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return Ok(());
+    }
+
+    let mut current = String::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() {
+            current = "/".to_string();
+            continue;
+        }
+        if current.is_empty() {
+            current = segment.to_string();
+        } else if current.ends_with('/') {
+            current.push_str(segment);
+        } else {
+            current.push('/');
+            current.push_str(segment);
+        }
+        let _ = sftp.create_dir(&current).await;
+    }
+    Ok(())
 }
 
 fn join_remote(base: &str, name: &str) -> String {

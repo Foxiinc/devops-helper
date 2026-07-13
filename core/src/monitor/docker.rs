@@ -79,7 +79,7 @@ impl DockerMonitor {
         server: &Server,
     ) -> CoreResult<Vec<DockerContainer>> {
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(db, server)?;
+            SessionManager::prepare_exec_credentials(db, server, None)?;
         Self::list_containers(
             sessions,
             server,
@@ -124,7 +124,7 @@ impl DockerMonitor {
         container: &str,
     ) -> CoreResult<Vec<ContainerProcess>> {
         let (password, private_key_pem, known_fingerprint) =
-            SessionManager::prepare_exec_credentials(db, server)?;
+            SessionManager::prepare_exec_credentials(db, server, None)?;
         Self::list_container_processes(
             sessions,
             server,

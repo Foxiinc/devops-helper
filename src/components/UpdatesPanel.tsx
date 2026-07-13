@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import type { PackageUpdate, Server, UpdatesReport } from "../types";
 import { api } from "../api";
 import { useUi } from "../context/UiContext";
-import { formatBackendError } from "../utils/backendError";
+import { formatBackendError, needsPasswordPrompt } from "../utils/backendError";
+import { withServerPassword } from "../utils/serverAccess";
 import { loadUiState, patchUiState } from "../state/persist";
 
 interface UpdatesPanelProps {
@@ -32,22 +33,29 @@ function cveTooltip(pkg: PackageUpdate) {
 }
 
 export function UpdatesPanel({ servers }: UpdatesPanelProps) {
-  const { toast } = useUi();
+  const { toast, confirm, prompt } = useUi();
   const [selectedServer, setSelectedServer] = useState(
     () => loadUiState().updatesServerId ?? "",
   );
   const [report, setReport] = useState<UpdatesReport | null>(null);
   const [loading, setLoading] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
+  const [lastOutput, setLastOutput] = useState<string | null>(null);
   const [includeCve, setIncludeCve] = useState(true);
   const [securityOnly, setSecurityOnly] = useState(false);
   const [minSeverity, setMinSeverity] = useState<"HIGH" | "CRITICAL">("HIGH");
+
+  const server = useMemo(
+    () => servers.find((s) => s.id === selectedServer),
+    [servers, selectedServer],
+  );
 
   useEffect(() => {
     patchUiState({ updatesServerId: selectedServer });
   }, [selectedServer]);
 
   const runCheck = async () => {
-    if (!selectedServer) {
+    if (!selectedServer || !server) {
       toast.warning("Select a server first");
       return;
     }
@@ -55,9 +63,68 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
     try {
       setReport(await api.checkUpdates(selectedServer, includeCve));
     } catch (err) {
-      toast.error(formatBackendError(err));
+      if (needsPasswordPrompt(err, server.auth_type)) {
+        const report = await withServerPassword(server, { toast, prompt, confirm }, (password) =>
+          api.checkUpdates(selectedServer, includeCve, password),
+        );
+        if (report) setReport(report);
+      } else {
+        toast.error(formatBackendError(err));
+      }
     } finally {
       setLoading(false);
+    }
+  };
+
+  const runUpgrade = async (packages?: string[]) => {
+    if (!selectedServer || !server) {
+      toast.warning("Select a server first");
+      return;
+    }
+
+    const label =
+      packages && packages.length > 0
+        ? packages.join(", ")
+        : `${report?.packages.length ?? 0} packages`;
+
+    const ok = await confirm({
+      title: packages?.length === 1 ? `Upgrade ${packages[0]}?` : "Run upgrade on server?",
+      message: `This will run apt-get/dnf on the remote host for: ${label}.`,
+      confirmLabel: "Upgrade",
+      danger: true,
+    });
+    if (!ok) return;
+
+    setUpgrading(true);
+    setLastOutput(null);
+    try {
+      const execute = (password?: string) =>
+        api.runUpdates(
+          selectedServer,
+          packages && packages.length > 0 ? packages : undefined,
+          password,
+        );
+
+      let result;
+      try {
+        result = await execute();
+      } catch (err) {
+        if (!needsPasswordPrompt(err, server.auth_type)) throw err;
+        result = await withServerPassword(server, { toast, prompt, confirm }, execute);
+        if (!result) return;
+      }
+
+      setLastOutput(result.output.trim() || "(no output)");
+      if (result.success) {
+        toast.success("Upgrade completed");
+        await runCheck();
+      } else {
+        toast.error(`Upgrade failed (exit ${result.exit_code})`);
+      }
+    } catch (err) {
+      toast.error(formatBackendError(err));
+    } finally {
+      setUpgrading(false);
     }
   };
 
@@ -76,12 +143,14 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
     return list;
   }, [report, securityOnly, includeCve, minSeverity]);
 
+  const busy = loading || upgrading;
+
   return (
     <div className="flex h-full flex-col">
       <div className="bb-border shrink-0 border-b px-6 py-4">
         <h2 className="bb-page-title">Updates</h2>
         <p className="bb-muted mt-1 text-sm">
-          Installed vs available packages · CVE hints via OSV (possible match)
+          Installed vs available packages · CVE hints via OSV · run apt/dnf upgrade from here
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -130,11 +199,22 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
           <button
             type="button"
             className="btn-primary text-sm"
-            disabled={!selectedServer || loading}
+            disabled={!selectedServer || busy}
             onClick={() => void runCheck()}
           >
             {loading ? "Checking…" : "Refresh"}
           </button>
+
+          {report && report.packages.length > 0 && (
+            <button
+              type="button"
+              className="btn-danger text-sm"
+              disabled={!selectedServer || busy}
+              onClick={() => void runUpgrade()}
+            >
+              {upgrading ? "Upgrading…" : "Upgrade all"}
+            </button>
+          )}
         </div>
 
         {report && (
@@ -142,6 +222,15 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
             {report.os.pretty_name} · {report.os.package_manager} · {report.packages.length}{" "}
             upgradable · checked {new Date(report.checked_at).toLocaleString()}
           </p>
+        )}
+
+        {lastOutput && (
+          <details className="mt-3">
+            <summary className="bb-muted cursor-pointer text-xs">Last upgrade output</summary>
+            <pre className="bb-surface-2 mt-2 max-h-40 overflow-auto rounded p-2 text-xs whitespace-pre-wrap">
+              {lastOutput}
+            </pre>
+          </details>
         )}
       </div>
 
@@ -161,7 +250,8 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
                 <th className="py-2 pr-2">Installed</th>
                 <th className="py-2 pr-2">Available</th>
                 <th className="py-2 pr-2">Size</th>
-                <th className="py-2">CVE</th>
+                <th className="py-2 pr-2">CVE</th>
+                <th className="py-2 w-24" />
               </tr>
             </thead>
             <tbody>
@@ -174,7 +264,7 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
                   <td className="py-1.5 pr-2 font-mono text-xs">{pkg.installed || "—"}</td>
                   <td className="py-1.5 pr-2 font-mono text-xs">{pkg.available}</td>
                   <td className="bb-muted py-1.5 pr-2 text-xs">{pkg.size ?? "—"}</td>
-                  <td className="py-1.5" title={cveTooltip(pkg)}>
+                  <td className="py-1.5 pr-2" title={cveTooltip(pkg)}>
                     {severityBadge(pkg.max_severity)}
                     {pkg.cves.length > 0 && (
                       <span className="bb-muted ml-1 text-xs">
@@ -182,11 +272,21 @@ export function UpdatesPanel({ servers }: UpdatesPanelProps) {
                       </span>
                     )}
                   </td>
+                  <td className="py-1.5">
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs px-2 py-1"
+                      disabled={busy}
+                      onClick={() => void runUpgrade([pkg.name])}
+                    >
+                      Upgrade
+                    </button>
+                  </td>
                 </tr>
               ))}
               {packages.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="bb-muted py-8 text-center">
+                  <td colSpan={6} className="bb-muted py-8 text-center">
                     No matching updates
                   </td>
                 </tr>

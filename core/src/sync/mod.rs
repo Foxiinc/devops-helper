@@ -1,10 +1,14 @@
+mod ignore;
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::db::SyncPairRecord;
-use crate::error::{CoreError, CoreResult};
-use crate::sftp::{list_local_dir, SftpConnectionPool, SftpBrowser};
+use crate::error::CoreResult;
+use crate::sftp::{SftpBrowser, SftpConnectionPool};
+
+use self::ignore::IgnoreRules;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -29,6 +33,14 @@ impl SyncDirection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncOptions {
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub use_gitignore: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPair {
     pub id: String,
@@ -37,6 +49,8 @@ pub struct SyncPair {
     pub local_path: String,
     pub remote_path: String,
     pub direction: SyncDirection,
+    #[serde(default)]
+    pub options: SyncOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,12 +58,18 @@ pub struct SyncPreviewItem {
     pub path: String,
     pub action: String,
     pub reason: String,
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPreview {
     pub items: Vec<SyncPreviewItem>,
     pub total_files: usize,
+    #[serde(default)]
+    pub skipped_count: usize,
+    #[serde(default)]
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +107,10 @@ impl SyncEngine {
             local_path: record.local_path.clone(),
             remote_path: record.remote_path.clone(),
             direction: SyncDirection::from_str(&record.direction),
+            options: SyncOptions {
+                ignore_patterns: record.ignore_patterns.clone(),
+                use_gitignore: record.use_gitignore,
+            },
         }
     }
 
@@ -97,7 +121,14 @@ impl SyncEngine {
         password: Option<String>,
         private_key_pem: Option<Vec<u8>>,
     ) -> CoreResult<SyncPreview> {
-        let local_files = collect_local_files(Path::new(&pair.local_path))?;
+        let base = Path::new(&pair.local_path);
+        let ignore = IgnoreRules::build(
+            base,
+            &pair.options.ignore_patterns,
+            pair.options.use_gitignore,
+        );
+
+        let (local_files, skipped_count) = collect_local_files(base, &ignore)?;
         let browser = pool
             .get_or_connect(&pair.server_id, server, password, private_key_pem)
             .await?;
@@ -108,10 +139,13 @@ impl SyncEngine {
             SyncDirection::Pull => diff_pull(&local_files, &remote_files),
         };
 
+        let total_bytes = items.iter().map(|i| i.size_bytes).sum();
         let total = items.len();
         Ok(SyncPreview {
             items,
             total_files: total,
+            skipped_count,
+            total_bytes,
         })
     }
 
@@ -127,7 +161,8 @@ impl SyncEngine {
     where
         F: FnMut(SyncProgress) + Send,
     {
-        let preview = Self::preview(pool, pair, server, password.clone(), private_key_pem.clone()).await?;
+        let preview =
+            Self::preview(pool, pair, server, password.clone(), private_key_pem.clone()).await?;
         if dry_run {
             return Ok(preview);
         }
@@ -142,7 +177,7 @@ impl SyncEngine {
                 current_file: item.path.clone(),
                 completed: index,
                 total,
-                bytes_transferred: 0,
+                bytes_transferred: item.size_bytes,
             });
 
             match (pair.direction.clone(), item.action.as_str()) {
@@ -172,24 +207,31 @@ impl SyncEngine {
             current_file: "done".into(),
             completed: total,
             total,
-            bytes_transferred: 0,
+            bytes_transferred: preview.total_bytes,
         });
 
         Ok(preview)
     }
 }
 
-fn collect_local_files(base: &Path) -> CoreResult<Vec<LocalFileInfo>> {
+fn collect_local_files(base: &Path, ignore: &IgnoreRules) -> CoreResult<(Vec<LocalFileInfo>, usize)> {
     let mut files = Vec::new();
+    let mut skipped = 0;
     if !base.exists() {
-        return Ok(files);
+        return Ok((files, skipped));
     }
 
-    walk_local(base, base, &mut files)?;
-    Ok(files)
+    walk_local(base, base, ignore, &mut files, &mut skipped)?;
+    Ok((files, skipped))
 }
 
-fn walk_local(base: &Path, current: &Path, out: &mut Vec<LocalFileInfo>) -> CoreResult<()> {
+fn walk_local(
+    base: &Path,
+    current: &Path,
+    ignore: &IgnoreRules,
+    out: &mut Vec<LocalFileInfo>,
+    skipped: &mut usize,
+) -> CoreResult<()> {
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
@@ -198,6 +240,14 @@ fn walk_local(base: &Path, current: &Path, out: &mut Vec<LocalFileInfo>) -> Core
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+
+        if ignore.is_ignored(&relative) {
+            *skipped += 1;
+            if entry.metadata()?.is_dir() {
+                continue;
+            }
+            continue;
+        }
 
         let metadata = entry.metadata()?;
         let modified = metadata
@@ -214,7 +264,7 @@ fn walk_local(base: &Path, current: &Path, out: &mut Vec<LocalFileInfo>) -> Core
                 size: 0,
                 modified,
             });
-            walk_local(base, &path, out)?;
+            walk_local(base, &path, ignore, out, skipped)?;
         } else {
             out.push(LocalFileInfo {
                 path,
@@ -281,12 +331,17 @@ fn diff_push(local: &[LocalFileInfo], remote: &[RemoteFileInfo]) -> Vec<SyncPrev
                 } else {
                     "new file".into()
                 },
+                size_bytes: lf.size,
             }),
             Some(rf) if !lf.path.is_dir() && (lf.size != rf.size || lf.modified > rf.modified) => {
                 items.push(SyncPreviewItem {
                     path: lf.relative.clone(),
                     action: "upload".into(),
-                    reason: format!("changed (local mtime {} > remote {})", lf.modified, rf.modified),
+                    reason: format!(
+                        "changed (local mtime {} > remote {})",
+                        lf.modified, rf.modified
+                    ),
+                    size_bytes: lf.size,
                 });
             }
             _ => {}
@@ -310,12 +365,18 @@ fn diff_pull(local: &[LocalFileInfo], remote: &[RemoteFileInfo]) -> Vec<SyncPrev
                 } else {
                     "new file".into()
                 },
+                size_bytes: rf.size,
             }),
-            Some(lf) if !rf.relative.ends_with('/') && (lf.size != rf.size || rf.modified > lf.modified) => {
+            Some(lf) if !rf.relative.ends_with('/') && (lf.size != rf.size || rf.modified > lf.modified)
+            => {
                 items.push(SyncPreviewItem {
                     path: rf.relative.clone(),
                     action: "download".into(),
-                    reason: format!("changed (remote mtime {} > local {})", rf.modified, lf.modified),
+                    reason: format!(
+                        "changed (remote mtime {} > local {})",
+                        rf.modified, lf.modified
+                    ),
+                    size_bytes: rf.size,
                 });
             }
             _ => {}

@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Server, ServerFolder, ServerInput, StoredKey } from "../types";
 import { api } from "../api";
 import { useUi } from "../context/UiContext";
+import { formatBackendError } from "../utils/backendError";
 
 interface ServerFormProps {
   server?: Server;
@@ -48,6 +49,21 @@ export function ServerForm({
       : { ...emptyForm, folder_id: defaultFolderId },
   );
   const [saving, setSaving] = useState(false);
+  const [credentialWarning, setCredentialWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!server) {
+      setCredentialWarning(null);
+      return;
+    }
+    void api.checkServerCredentials(server.id).then((check) => {
+      if (!check.ok && check.message) {
+        setCredentialWarning(formatBackendError(check.message));
+      } else {
+        setCredentialWarning(null);
+      }
+    });
+  }, [server]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -88,6 +104,11 @@ export function ServerForm({
       <h3 className="bb-accent text-sm font-semibold">
         {server ? "Edit server" : "Add server"}
       </h3>
+      {credentialWarning && (
+        <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          {credentialWarning}
+        </p>
+      )}
       <input
         className="input"
         placeholder="Name"
@@ -146,7 +167,7 @@ export function ServerForm({
         <input
           className="input"
           type="password"
-          placeholder={server ? "Password (leave empty to keep)" : "Password"}
+          placeholder={server ? "Password (required if vault was reset)" : "Password"}
           value={form.password ?? ""}
           onChange={(e) => setForm({ ...form, password: e.target.value })}
         />

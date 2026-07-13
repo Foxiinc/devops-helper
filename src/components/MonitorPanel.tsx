@@ -8,7 +8,8 @@ import type {
 } from "../types";
 import { api } from "../api";
 import { useUi } from "../context/UiContext";
-import { formatBackendError } from "../utils/backendError";
+import { formatBackendError, needsPasswordPrompt } from "../utils/backendError";
+import { withServerPassword } from "../utils/serverAccess";
 import { loadUiState, patchUiState } from "../state/persist";
 
 interface MonitorPanelProps {
@@ -16,11 +17,48 @@ interface MonitorPanelProps {
 }
 
 type MonitorMode = "host" | "docker";
+type HostSortKey = "pid" | "user" | "cpu_percent" | "mem_percent" | "command";
+type DockerSortKey = "name" | "cpu_percent" | "mem_percent" | "status";
+type SortDir = "asc" | "desc";
 
 const REFRESH_MS = 5000;
 
+function sortDirLabel(active: boolean, dir: SortDir) {
+  if (!active) return " ↕";
+  return dir === "asc" ? " ↑" : " ↓";
+}
+
+function SortableHeader({
+  label,
+  active,
+  dir,
+  onClick,
+  className = "",
+}: {
+  label: string;
+  active: boolean;
+  dir: SortDir;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <th className={`py-2 pr-2 ${className}`}>
+      <button
+        type="button"
+        className={`bb-muted inline-flex items-center gap-0.5 text-xs uppercase tracking-wide hover:text-[var(--bb-text)] ${
+          active ? "text-[var(--bb-text)]" : ""
+        }`}
+        onClick={onClick}
+      >
+        {label}
+        <span className="font-mono text-[10px] opacity-70">{sortDirLabel(active, dir)}</span>
+      </button>
+    </th>
+  );
+}
+
 export function MonitorPanel({ servers }: MonitorPanelProps) {
-  const { toast, prompt } = useUi();
+  const { toast, prompt, confirm } = useUi();
   const [selectedServer, setSelectedServer] = useState(
     () => loadUiState().monitorServerId ?? "",
   );
@@ -31,38 +69,88 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
   const [containerProcs, setContainerProcs] = useState<Record<string, ContainerProcess[]>>({});
   const [trustMap, setTrustMap] = useState<Record<number, ProcessTrustInfo>>({});
   const [filter, setFilter] = useState("");
+  const [hostSort, setHostSort] = useState<{ key: HostSortKey; dir: SortDir }>({
+    key: "cpu_percent",
+    dir: "desc",
+  });
+  const [dockerSort, setDockerSort] = useState<{ key: DockerSortKey; dir: SortDir }>({
+    key: "cpu_percent",
+    dir: "desc",
+  });
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [authBlocked, setAuthBlocked] = useState(false);
+
+  const server = useMemo(
+    () => servers.find((s) => s.id === selectedServer),
+    [servers, selectedServer],
+  );
 
   useEffect(() => {
     patchUiState({ monitorServerId: selectedServer });
+    setAuthBlocked(false);
   }, [selectedServer]);
 
+  const fetchData = useCallback(
+    async (password?: string) => {
+      if (!selectedServer) return null;
+      if (mode === "host") {
+        return api.refreshProcesses(selectedServer, password);
+      }
+      return api.listDockerContainers(selectedServer, password);
+    },
+    [mode, selectedServer],
+  );
+
   const refresh = useCallback(async () => {
-    if (!selectedServer) return;
+    if (!selectedServer || !server) return;
     setLoading(true);
     try {
+      const data = await fetchData();
+      if (!data) return;
       if (mode === "host") {
-        setProcesses(await api.refreshProcesses(selectedServer));
+        setProcesses(data as ProcessInfo[]);
       } else {
-        setContainers(await api.listDockerContainers(selectedServer));
+        setContainers(data as DockerContainer[]);
       }
+      setAuthBlocked(false);
     } catch (err) {
+      if (needsPasswordPrompt(err, server.auth_type)) {
+        setAuthBlocked(true);
+        return;
+      }
       toast.error(formatBackendError(err));
     } finally {
       setLoading(false);
     }
-  }, [mode, selectedServer, toast]);
+  }, [fetchData, mode, selectedServer, server, toast]);
+
+  const unlockWithPassword = async () => {
+    if (!server) return;
+    setLoading(true);
+    try {
+      const data = await withServerPassword(server, { toast, prompt, confirm }, fetchData);
+      if (!data) return;
+      if (mode === "host") {
+        setProcesses(data as ProcessInfo[]);
+      } else {
+        setContainers(data as DockerContainer[]);
+      }
+      setAuthBlocked(false);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   useEffect(() => {
-    if (!autoRefresh || !selectedServer) return;
+    if (!autoRefresh || !selectedServer || authBlocked) return;
     const id = window.setInterval(() => void refresh(), REFRESH_MS);
     return () => window.clearInterval(id);
-  }, [autoRefresh, refresh, selectedServer]);
+  }, [autoRefresh, authBlocked, refresh, selectedServer]);
 
   const filteredProcesses = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -75,6 +163,90 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
         String(p.pid).includes(q),
     );
   }, [filter, processes]);
+
+  const filteredContainers = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    if (!q) return containers;
+    return containers.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        c.image.toLowerCase().includes(q) ||
+        c.status.toLowerCase().includes(q),
+    );
+  }, [containers, filter]);
+
+  const sortedProcesses = useMemo(() => {
+    const list = [...filteredProcesses];
+    const { key, dir } = hostSort;
+    const mul = dir === "asc" ? 1 : -1;
+
+    list.sort((a, b) => {
+      switch (key) {
+        case "pid":
+          return (a.pid - b.pid) * mul;
+        case "cpu_percent":
+          return (a.cpu_percent - b.cpu_percent) * mul;
+        case "mem_percent":
+          return (a.mem_percent - b.mem_percent) * mul;
+        case "user":
+          return a.user.localeCompare(b.user, undefined, { sensitivity: "base" }) * mul;
+        case "command": {
+          const left = (a.cmdline || a.comm).toLowerCase();
+          const right = (b.cmdline || b.comm).toLowerCase();
+          return left.localeCompare(right) * mul;
+        }
+        default:
+          return 0;
+      }
+    });
+
+    return list;
+  }, [filteredProcesses, hostSort]);
+
+  const sortedContainers = useMemo(() => {
+    const list = [...filteredContainers];
+    const { key, dir } = dockerSort;
+    const mul = dir === "asc" ? 1 : -1;
+
+    list.sort((a, b) => {
+      switch (key) {
+        case "name":
+          return a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) * mul;
+        case "cpu_percent":
+          return (a.cpu_percent - b.cpu_percent) * mul;
+        case "mem_percent":
+          return (a.mem_percent - b.mem_percent) * mul;
+        case "status":
+          return a.status.localeCompare(b.status, undefined, { sensitivity: "base" }) * mul;
+        default:
+          return 0;
+      }
+    });
+
+    return list;
+  }, [filteredContainers, dockerSort]);
+
+  const toggleHostSort = (key: HostSortKey) => {
+    setHostSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : {
+            key,
+            dir: key === "cpu_percent" || key === "mem_percent" ? "desc" : "asc",
+          },
+    );
+  };
+
+  const toggleDockerSort = (key: DockerSortKey) => {
+    setDockerSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : {
+            key,
+            dir: key === "cpu_percent" || key === "mem_percent" ? "desc" : "asc",
+          },
+    );
+  };
 
   const verifyTrust = async (pid: number) => {
     if (!selectedServer) return;
@@ -166,10 +338,9 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
 
           <input
             className="input max-w-xs"
-            placeholder="Filter name / user…"
+            placeholder={mode === "host" ? "Filter name / user…" : "Filter container…"}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            disabled={mode === "docker"}
           />
 
           <label className="bb-muted flex items-center gap-2 text-sm">
@@ -190,6 +361,19 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
             {loading ? "Refreshing…" : "Refresh"}
           </button>
         </div>
+
+        {authBlocked && (
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <span>Stored password cannot be decrypted — enter it again to continue.</span>
+            <button
+              type="button"
+              className="btn-primary px-2 py-1 text-xs"
+              onClick={() => void unlockWithPassword()}
+            >
+              Enter password
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto p-4">
@@ -198,19 +382,51 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
         )}
 
         {selectedServer && mode === "host" && (
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="bb-muted border-b border-[var(--bb-border)] text-xs uppercase">
-                <th className="py-2 pr-2">PID</th>
-                <th className="py-2 pr-2">User</th>
-                <th className="py-2 pr-2">CPU%</th>
-                <th className="py-2 pr-2">MEM%</th>
-                <th className="py-2 pr-2">Command</th>
-                <th className="py-2">Trust</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredProcesses.map((p) => {
+          <>
+            <p className="bb-muted mb-2 text-xs">
+              {sortedProcesses.length} process{sortedProcesses.length === 1 ? "" : "es"}
+              {filter.trim() && processes.length !== sortedProcesses.length
+                ? ` (filtered from ${processes.length})`
+                : ""}
+            </p>
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-[var(--bb-border)]">
+                  <SortableHeader
+                    label="PID"
+                    active={hostSort.key === "pid"}
+                    dir={hostSort.dir}
+                    onClick={() => toggleHostSort("pid")}
+                  />
+                  <SortableHeader
+                    label="User"
+                    active={hostSort.key === "user"}
+                    dir={hostSort.dir}
+                    onClick={() => toggleHostSort("user")}
+                  />
+                  <SortableHeader
+                    label="CPU%"
+                    active={hostSort.key === "cpu_percent"}
+                    dir={hostSort.dir}
+                    onClick={() => toggleHostSort("cpu_percent")}
+                  />
+                  <SortableHeader
+                    label="MEM%"
+                    active={hostSort.key === "mem_percent"}
+                    dir={hostSort.dir}
+                    onClick={() => toggleHostSort("mem_percent")}
+                  />
+                  <SortableHeader
+                    label="Command"
+                    active={hostSort.key === "command"}
+                    dir={hostSort.dir}
+                    onClick={() => toggleHostSort("command")}
+                  />
+                  <th className="bb-muted py-2 text-xs uppercase">Trust</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedProcesses.map((p) => {
                 const trust = trustMap[p.pid];
                 return (
                   <tr
@@ -252,16 +468,56 @@ export function MonitorPanel({ servers }: MonitorPanelProps) {
                   </tr>
                 );
               })}
+              {sortedProcesses.length === 0 && !loading && (
+                <tr>
+                  <td colSpan={6} className="bb-muted py-6 text-center text-sm">
+                    No matching processes
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
+          </>
         )}
 
         {selectedServer && mode === "docker" && (
           <div className="space-y-2">
-            {containers.length === 0 && !loading && (
+            <div className="bb-muted mb-2 flex flex-wrap items-center gap-2 text-xs">
+              <span>
+                {sortedContainers.length} container{sortedContainers.length === 1 ? "" : "s"}
+                {filter.trim() && containers.length !== sortedContainers.length
+                  ? ` (filtered from ${containers.length})`
+                  : ""}
+              </span>
+              <span className="opacity-60">·</span>
+              <span>Sort:</span>
+              {(
+                [
+                  ["name", "Name"],
+                  ["cpu_percent", "CPU"],
+                  ["mem_percent", "MEM"],
+                  ["status", "Status"],
+                ] as const
+              ).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={`rounded px-1.5 py-0.5 ${
+                    dockerSort.key === key
+                      ? "bg-[color-mix(in_srgb,var(--bb-accent)_20%,transparent)] text-[var(--bb-text)]"
+                      : "hover:text-[var(--bb-text)]"
+                  }`}
+                  onClick={() => toggleDockerSort(key)}
+                >
+                  {label}
+                  {sortDirLabel(dockerSort.key === key, dockerSort.dir)}
+                </button>
+              ))}
+            </div>
+            {sortedContainers.length === 0 && !loading && (
               <p className="bb-muted text-sm">No containers or Docker unavailable</p>
             )}
-            {containers.map((c) => (
+            {sortedContainers.map((c) => (
               <div key={c.id} className="bb-card rounded-lg p-3">
                 <button
                   type="button"

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { api } from "./api";
+import { api, logUiAction } from "./api";
 import type { HostKeyPrompt, Server, ServerFolder, StoredKey, TabId, TerminalTab } from "./types";
 import { hydrateUiState, loadUiState, persistUiState } from "./state/persist";
 import { ThemeProvider } from "./context/ThemeContext";
@@ -21,14 +21,16 @@ import { HostKeyDialog } from "./components/HostKeyDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SftpPanel } from "./components/SftpPanel";
 import { SyncPanel } from "./components/SyncPanel";
+import type { SyncDraft } from "./components/sync/SyncSetupSheet";
 import { ScenariosPanel } from "./components/ScenariosPanel";
 import { MonitorPanel } from "./components/MonitorPanel";
 import { UpdatesPanel } from "./components/UpdatesPanel";
 import { useUi } from "./context/UiContext";
 import { formatBackendError } from "./utils/backendError";
+import { connectWithCredentials } from "./utils/connectServer";
 
 function AppShell() {
-  const { toast } = useUi();
+  const { toast, prompt, confirm } = useUi();
   const [hydrated, setHydrated] = useState(false);
   const [initialTheme, setInitialTheme] = useState<ThemeSettings>(DEFAULT_THEME_SETTINGS);
   const restoredSessions = useRef(false);
@@ -46,9 +48,21 @@ function AppShell() {
   const [hostKeyPrompt, setHostKeyPrompt] = useState<HostKeyPrompt | null>(null);
   const [restoringSessions, setRestoringSessions] = useState(false);
   const [restoreStatus, setRestoreStatus] = useState<string | null>(null);
+  const [syncSetupDraft, setSyncSetupDraft] = useState<SyncDraft | null>(null);
 
   const refresh = useCallback(async () => {
     let serverList: Server[] = [];
+
+    try {
+      if (await api.getVaultStatus()) {
+        toast.warning(
+          "Encryption key was reset — edit each server and re-enter the password (or re-import SSH keys).",
+        );
+        await api.dismissVaultNotice();
+      }
+    } catch {
+      // ignore
+    }
 
     try {
       serverList = await api.listServers();
@@ -76,10 +90,19 @@ function AppShell() {
   const navigate = useCallback(
     (view: TabId) => {
       if (isViewAvailable(view, navPrefs)) {
+        logUiAction("ui.navigate", view);
         setActiveView(view);
       }
     },
     [navPrefs],
+  );
+
+  const openSyncSetup = useCallback(
+    (draft: SyncDraft) => {
+      setSyncSetupDraft(draft);
+      navigate("sync");
+    },
+    [navigate],
   );
 
   const updateNavPrefs = useCallback((next: NavPreferences) => {
@@ -165,7 +188,16 @@ function AppShell() {
           continue;
         }
         try {
-          const session = await api.connectSession(server.id, 120, 30);
+          const session = await connectWithCredentials(
+            server,
+            { toast, prompt, confirm },
+            120,
+            30,
+          );
+          if (!session) {
+            failed += 1;
+            continue;
+          }
           restored.push({
             sessionId: session.id,
             serverId: server.id,
@@ -230,17 +262,19 @@ function AppShell() {
 
     setActiveView("terminal");
     setRestoreStatus(null);
-    try {
-      const session = await api.connectSession(server.id, 120, 30);
-      const title = `${server.name} (${server.username}@${server.host})`;
-      setTerminalTabs((prev) => [
-        ...prev,
-        { sessionId: session.id, serverId: server.id, title },
-      ]);
-      setActiveSessionId(session.id);
-    } catch (err) {
-      toast.error(formatBackendError(err));
-    }
+
+    const session = await connectWithCredentials(
+      server,
+      { toast, prompt, confirm },
+    );
+    if (!session) return;
+
+    const title = `${server.name} (${server.username}@${server.host})`;
+    setTerminalTabs((prev) => [
+      ...prev,
+      { sessionId: session.id, serverId: server.id, title },
+    ]);
+    setActiveSessionId(session.id);
   };
 
   const closeTab = useCallback(async (sessionId: string) => {
@@ -289,12 +323,16 @@ function AppShell() {
       <div
         className={`absolute inset-0 overflow-hidden ${activeView === "files" ? "z-10" : "hidden"}`}
       >
-        <SftpPanel servers={servers} />
+        <SftpPanel servers={servers} onOpenSyncSetup={openSyncSetup} />
       </div>
       <div
         className={`absolute inset-0 overflow-y-auto ${activeView === "sync" ? "z-10" : "hidden"}`}
       >
-        <SyncPanel servers={servers} />
+        <SyncPanel
+          servers={servers}
+          setupDraft={syncSetupDraft}
+          onClearSetupDraft={() => setSyncSetupDraft(null)}
+        />
       </div>
       <div
         className={`absolute inset-0 overflow-hidden ${activeView === "monitor" ? "z-10" : "hidden"}`}

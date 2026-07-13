@@ -9,7 +9,7 @@ use crate::db::{Database, Server};
 use crate::error::CoreResult;
 use crate::session::SessionManager;
 use crate::sftp::SftpConnectionPool;
-use crate::sync::{SyncDirection, SyncEngine, SyncPair};
+use crate::sync::{SyncDirection, SyncEngine, SyncOptions, SyncPair};
 
 pub use bastion::{action_label, parse, BastionAction, ParsedScenario};
 
@@ -272,6 +272,7 @@ async fn run_sync_step(
         local_path: local_path.to_string(),
         remote_path: remote_path.to_string(),
         direction: SyncDirection::Push,
+        options: SyncOptions::default(),
     };
 
     match SyncEngine::run(

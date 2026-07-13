@@ -139,22 +139,10 @@ impl SessionManager {
         server: &Server,
         cols: u32,
         rows: u32,
+        password_override: Option<&str>,
     ) -> CoreResult<(SessionConfig, String, Option<String>)> {
-        let password = if server.auth_type == AuthType::Password {
-            db.get_server_password(&server.id)?
-        } else {
-            None
-        };
-
-        let private_key_pem = if server.auth_type == AuthType::Key {
-            server
-                .key_id
-                .as_ref()
-                .map(|key_id| db.get_key_private_pem(key_id))
-                .transpose()?
-        } else {
-            None
-        };
+        let password = Self::resolve_password(db, server, password_override)?;
+        let private_key_pem = Self::resolve_private_key(db, server, None)?;
 
         let config = SessionConfig {
             host: server.host.clone(),
@@ -178,28 +166,48 @@ impl SessionManager {
     pub fn prepare_exec_credentials(
         db: &Database,
         server: &Server,
+        password_override: Option<&str>,
     ) -> CoreResult<(Option<String>, Option<Vec<u8>>, Option<String>)> {
-        let password = if server.auth_type == AuthType::Password {
-            db.get_server_password(&server.id)?
-        } else {
-            None
-        };
-
-        let private_key_pem = if server.auth_type == AuthType::Key {
-            server
-                .key_id
-                .as_ref()
-                .map(|key_id| db.get_key_private_pem(key_id))
-                .transpose()?
-        } else {
-            None
-        };
+        let password = Self::resolve_password(db, server, password_override)?;
+        let private_key_pem = Self::resolve_private_key(db, server, None)?;
 
         let known_fingerprint = db
             .get_known_host(&server.host, server.port)?
             .map(|h| h.fingerprint);
 
         Ok((password, private_key_pem, known_fingerprint))
+    }
+
+    fn resolve_password(
+        db: &Database,
+        server: &Server,
+        password_override: Option<&str>,
+    ) -> CoreResult<Option<String>> {
+        if server.auth_type != AuthType::Password {
+            return Ok(None);
+        }
+        if let Some(password) = password_override.filter(|p| !p.is_empty()) {
+            return Ok(Some(password.to_string()));
+        }
+        db.get_server_password(&server.id)
+    }
+
+    fn resolve_private_key(
+        db: &Database,
+        server: &Server,
+        pem_override: Option<Vec<u8>>,
+    ) -> CoreResult<Option<Vec<u8>>> {
+        if server.auth_type != AuthType::Key {
+            return Ok(None);
+        }
+        if let Some(pem) = pem_override {
+            return Ok(Some(pem));
+        }
+        server
+            .key_id
+            .as_ref()
+            .map(|key_id| db.get_key_private_pem(key_id))
+            .transpose()
     }
 
     pub async fn connect_with_server(
@@ -210,7 +218,7 @@ impl SessionManager {
         rows: u32,
     ) -> CoreResult<SessionSummary> {
         let (config, server_id, known_fingerprint) =
-            Self::prepare_server_connection(db, server, cols, rows)?;
+            Self::prepare_server_connection(db, server, cols, rows, None)?;
         self.connect(config, Some(server_id), known_fingerprint).await
     }
 
@@ -247,7 +255,7 @@ impl SessionManager {
             AuthType::Password => {
                 let password = config
                     .password
-                    .ok_or_else(|| CoreError::Other("password required".into()))?;
+                    .ok_or(CoreError::PasswordRequired)?;
                 let auth = handle.authenticate_password(&config.username, &password).await?;
                 if !auth.success() {
                     return Err(CoreError::AuthFailed);
@@ -256,7 +264,7 @@ impl SessionManager {
             AuthType::Key => {
                 let pem = config
                     .private_key_pem
-                    .ok_or_else(|| CoreError::Other("private key required".into()))?;
+                    .ok_or(CoreError::PrivateKeyRequired)?;
                 let key_pair = PrivateKey::from_openssh(&pem)
                     .map_err(|e| CoreError::Other(e.to_string()))?;
                 let auth = handle
@@ -457,14 +465,14 @@ impl SessionManager {
 
         match config.auth_type {
             AuthType::Password => {
-                let password = config.password.unwrap();
+                let password = config.password.ok_or(CoreError::PasswordRequired)?;
                 let auth = handle.authenticate_password(&config.username, &password).await?;
                 if !auth.success() {
                     return Err(CoreError::AuthFailed);
                 }
             }
             AuthType::Key => {
-                let pem = config.private_key_pem.unwrap();
+                let pem = config.private_key_pem.ok_or(CoreError::PrivateKeyRequired)?;
                 let key_pair = PrivateKey::from_openssh(&pem)
                     .map_err(|e| CoreError::Other(e.to_string()))?;
                 let auth = handle

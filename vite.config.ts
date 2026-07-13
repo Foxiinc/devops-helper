@@ -19,7 +19,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // Cargo writes DLLs under target/ — watching them causes EBUSY on Windows
+      ignored: ["**/src-tauri/**", "**/target/**"],
     },
   },
 }));

@@ -3,25 +3,24 @@ import { listen } from "@tauri-apps/api/event";
 import type { Server, SyncPairRecord, SyncPreview, SyncProgress } from "../types";
 import { api } from "../api";
 import { useUi } from "../context/UiContext";
-import { loadUiState, patchSyncFormState } from "../state/persist";
+import { SyncPreviewList } from "./sync/SyncPreviewList";
+import { SyncSetupSheet, type SyncDraft } from "./sync/SyncSetupSheet";
+import { previewSummary } from "./sync/syncUtils";
 
 interface SyncPanelProps {
   servers: Server[];
+  setupDraft: SyncDraft | null;
+  onClearSetupDraft: () => void;
 }
 
-export function SyncPanel({ servers }: SyncPanelProps) {
+export function SyncPanel({ servers, setupDraft, onClearSetupDraft }: SyncPanelProps) {
   const { toast, confirm } = useUi();
-  const savedForm = loadUiState().syncForm;
   const [pairs, setPairs] = useState<SyncPairRecord[]>([]);
   const [preview, setPreview] = useState<SyncPreview | null>(null);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
-  const [form, setForm] = useState({
-    name: "",
-    server_id: savedForm.server_id,
-    local_path: savedForm.local_path,
-    remote_path: savedForm.remote_path,
-    direction: savedForm.direction,
-  });
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [runningId, setRunningId] = useState<string | null>(null);
+  const [showNew, setShowNew] = useState(false);
 
   const load = async () => {
     setPairs(await api.listSyncPairs());
@@ -36,20 +35,8 @@ export function SyncPanel({ servers }: SyncPanelProps) {
   }, []);
 
   useEffect(() => {
-    patchSyncFormState({
-      server_id: form.server_id,
-      local_path: form.local_path,
-      remote_path: form.remote_path,
-      direction: form.direction,
-    });
-  }, [form.server_id, form.local_path, form.remote_path, form.direction]);
-
-  const create = async () => {
-    await api.createSyncPair(form);
-    setForm({ ...form, name: "" });
-    toast.success("Sync pair saved");
-    await load();
-  };
+    if (setupDraft) setShowNew(true);
+  }, [setupDraft]);
 
   const remove = async (id: string) => {
     const ok = await confirm({
@@ -65,81 +52,78 @@ export function SyncPanel({ servers }: SyncPanelProps) {
   };
 
   const dryRun = async (id: string) => {
-    toast.info("Computing diff...");
-    const result = await api.runSync(id, true);
-    setPreview(result);
-    toast.success(`Dry run: ${result.total_files} files to sync`);
+    setAnalyzingId(id);
+    setPreview(null);
+    try {
+      toast.info("Computing diff…");
+      const result = await api.runSync(id, true);
+      setPreview(result);
+      toast.success(previewSummary(result));
+    } catch (err) {
+      toast.error(String(err));
+    } finally {
+      setAnalyzingId(null);
+    }
   };
 
   const run = async (id: string) => {
-    toast.info("Syncing...");
+    const ok = await confirm({
+      title: "Run sync",
+      message: "Transfer changed files now?",
+      confirmLabel: "Sync",
+    });
+    if (!ok) return;
+
+    setRunningId(id);
     setProgress(null);
-    const result = await api.runSync(id, false);
-    setPreview(result);
-    toast.success(`Sync complete: ${result.total_files} files processed`);
+    try {
+      toast.info("Syncing…");
+      const result = await api.runSync(id, false);
+      setPreview(result);
+      toast.success(`Done: ${result.total_files} files`);
+    } catch (err) {
+      toast.error(String(err));
+    } finally {
+      setRunningId(null);
+    }
+  };
+
+  const closeSetup = () => {
+    setShowNew(false);
+    onClearSetupDraft();
+  };
+
+  const emptyDraft: SyncDraft = {
+    serverId: "",
+    localPath: "C:\\Users",
+    remotePath: "/home",
+    direction: "push",
   };
 
   return (
     <div className="h-full overflow-y-auto p-6">
-      <h2 className="bb-page-title">Sync (rsync-like)</h2>
-      <p className="bb-muted mt-1 text-sm">Compare by mtime + size, transfer only changes</p>
-
-      <div className="bb-card mt-6 grid gap-3 rounded-lg p-4 md:grid-cols-2">
-        <input
-          className="input"
-          placeholder="Pair name"
-          value={form.name}
-          onChange={(e) => setForm({ ...form, name: e.target.value })}
-        />
-        <select
-          className="input"
-          value={form.server_id}
-          onChange={(e) => setForm({ ...form, server_id: e.target.value })}
-        >
-          <option value="">Server...</option>
-          {servers.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name}
-            </option>
-          ))}
-        </select>
-        <input
-          className="input"
-          placeholder="Local path"
-          value={form.local_path}
-          onChange={(e) => setForm({ ...form, local_path: e.target.value })}
-        />
-        <input
-          className="input"
-          placeholder="Remote path"
-          value={form.remote_path}
-          onChange={(e) => setForm({ ...form, remote_path: e.target.value })}
-        />
-        <select
-          className="input"
-          value={form.direction}
-          onChange={(e) => setForm({ ...form, direction: e.target.value })}
-        >
-          <option value="push">Push (local → remote)</option>
-          <option value="pull">Pull (remote → local)</option>
-        </select>
-        <button className="btn-primary" onClick={create}>
-          Save sync pair
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="bb-page-title">Sync</h2>
+          <p className="bb-muted mt-1 text-sm">
+            rsync-like diff (mtime + size). Create pairs from Files or here.
+          </p>
+        </div>
+        <button type="button" className="btn-primary" onClick={() => setShowNew(true)}>
+          + New sync pair
         </button>
       </div>
 
       {progress && (
-        <div className="bb-card mt-4 rounded-lg p-3 text-sm">
-          <p>
+        <div className="bb-card mt-6 rounded-lg p-3 text-sm">
+          <p className="bb-muted truncate font-mono text-xs">
             {progress.completed}/{progress.total}: {progress.current_file}
           </p>
           <div className="bb-progress-track mt-2 h-2">
             <div
               className="bb-progress-bar"
               style={{
-                width: progress.total
-                  ? `${(progress.completed / progress.total) * 100}%`
-                  : "0%",
+                width: progress.total ? `${(progress.completed / progress.total) * 100}%` : "0%",
               }}
             />
           </div>
@@ -147,50 +131,81 @@ export function SyncPanel({ servers }: SyncPanelProps) {
       )}
 
       <div className="mt-6 space-y-3">
-        {pairs.map((pair) => (
-          <div key={pair.id} className="bb-card rounded-lg p-4">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="bb-text font-medium">{pair.name}</p>
-                <p className="bb-muted mt-1 text-xs">
-                  {pair.direction}: {pair.local_path} ↔ {pair.remote_path}
-                </p>
-              </div>
-              <div className="flex gap-2">
-                <button className="btn-secondary text-xs" onClick={() => dryRun(pair.id)}>
-                  Dry run
-                </button>
-                <button className="btn-primary text-xs" onClick={() => run(pair.id)}>
-                  Sync
-                </button>
-                <button
-                  className="btn-secondary text-xs text-[var(--bb-danger)]"
-                  onClick={() => remove(pair.id)}
-                >
-                  Delete
-                </button>
+        {pairs.length === 0 && (
+          <div className="bb-card bb-muted rounded-xl p-8 text-center text-sm">
+            No saved pairs yet. Open <strong>Files</strong>, browse to your project folders, and
+            click <strong>Sync this folder</strong>.
+          </div>
+        )}
+        {pairs.map((pair) => {
+          const server = servers.find((s) => s.id === pair.server_id);
+          return (
+            <div key={pair.id} className="bb-card rounded-xl p-4">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="bb-text font-medium">{pair.name}</p>
+                  <p className="bb-muted mt-1 text-xs">
+                    {pair.direction === "pull" ? "Pull" : "Push"}
+                    {server ? ` · ${server.name}` : ""}
+                  </p>
+                  <p className="bb-muted mt-2 truncate font-mono text-xs" title={pair.local_path}>
+                    {pair.local_path}
+                  </p>
+                  <p className="bb-muted truncate font-mono text-xs" title={pair.remote_path}>
+                    ↔ {pair.remote_path}
+                  </p>
+                  {(pair.ignore_patterns?.length ?? 0) > 0 && (
+                    <p className="bb-muted mt-2 text-xs">
+                      Ignore: {pair.ignore_patterns?.join(", ")}
+                      {pair.use_gitignore ? " + .gitignore" : ""}
+                    </p>
+                  )}
+                </div>
+                <div className="flex shrink-0 flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs"
+                    disabled={analyzingId === pair.id || runningId === pair.id}
+                    onClick={() => void dryRun(pair.id)}
+                  >
+                    {analyzingId === pair.id ? "Analyzing…" : "Analyze"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary text-xs"
+                    disabled={analyzingId === pair.id || runningId === pair.id}
+                    onClick={() => void run(pair.id)}
+                  >
+                    {runningId === pair.id ? "Syncing…" : "Run"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs text-[var(--bb-danger)]"
+                    onClick={() => void remove(pair.id)}
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
-      {preview && preview.items.length > 0 && (
+      {preview && (
         <div className="mt-6">
-          <h3 className="bb-text text-sm font-semibold">Preview ({preview.total_files})</h3>
-          <div className="bb-panel mt-2 max-h-64 overflow-y-auto">
-            {preview.items.map((item, i) => (
-              <div
-                key={i}
-                className="bb-border bb-text flex gap-3 border-b px-3 py-2 font-mono text-xs last:border-b-0"
-              >
-                <span className="bb-accent shrink-0">{item.action}</span>
-                <span className="flex-1 truncate">{item.path}</span>
-                <span className="bb-muted shrink-0">{item.reason}</span>
-              </div>
-            ))}
-          </div>
+          <h3 className="bb-text mb-2 text-sm font-semibold">Last analysis</h3>
+          <SyncPreviewList preview={preview} />
         </div>
+      )}
+
+      {showNew && (
+        <SyncSetupSheet
+          servers={servers}
+          draft={setupDraft ?? emptyDraft}
+          onClose={closeSetup}
+          onSaved={() => void load()}
+        />
       )}
     </div>
   );
